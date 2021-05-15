@@ -21,21 +21,58 @@
 
 #include <getopt.h>
 #include <stdlib.h>
+#include <sys/time.h>
 #include "ubertooth.h"
 
 uint8_t debug;
+uint8_t with_timestamp;
+
+//
+// WiFiの周波数は 2401-2495(14) 2483(13)
+// このツールでも，-l2401 -u2483 とオプションを付ければ，その範囲で出る．
+// -u2495とすると一応出るのだが，本当か？
+// → 一応その通りに動いている様子．
+// CC2400のソースでは，2049-3072でリミットがかけられているが，
+// 実際に動作するのは2300-2700で，周波数特性の問題があり，
+// 2400-2600が現実的．
+//
+
+#define WIFI_CH1_FREQ_LO 2401
+
+
+typedef struct {
+	int dropit;
+	int lo_freq;
+	int hi_hireq;
+} SPECAN_PARAM;
+
+static SPECAN_PARAM sp_param;
 
 void cb_specan(ubertooth_t* ut __attribute__((unused)), void* args)
 {
-	uint16_t high_freq = (((uint8_t*)args)[0]) |
-	                     (((uint8_t*)args)[1] << 8);
-	uint8_t output_mode = ((uint8_t*)args)[2];
-
-	usb_pkt_rx rx = fifo_pop(ut->fifo);
 	int r, j;
 	uint16_t frequency;
 	int8_t rssi;
+	struct timeval tv;
+	double t;
 
+//	uint16_t high_freq = (((uint8_t*)args)[0]) |
+//	                     (((uint8_t*)args)[1] << 8);
+	uint8_t output_mode = ((uint8_t*)args)[2];
+
+	usb_pkt_rx rx = fifo_pop(ut->fifo);
+	// 最初にゴミデータが来るので読み捨てる
+	if( sp_param.dropit > 0 )
+	{
+		sp_param.dropit--;
+		return;
+	}
+
+	gettimeofday(&tv, NULL);
+	t = ((double)rx.clk100ns)/10000000;
+
+	// 16サンプルずつ呼ばれる
+	// DMA_SIZEは50
 	/* process each received block */
 	for (j = 0; j < DMA_SIZE-2; j += 3) {
 		frequency = (rx.data[j] << 8) | rx.data[j + 1];
@@ -49,18 +86,29 @@ void cb_specan(ubertooth_t* ut __attribute__((unused)), void* args)
 				}
 				break;
 			case SPECAN_STDOUT:
-				printf("%f, %d, %d\n", ((double)rx.clk100ns)/10000000,
-				       frequency, rssi);
+				if( with_timestamp )
+				{
+					if( j == 0 )
+					{
+						printf("%ld.%06d,%f,%d,%d", tv.tv_sec, tv.tv_usec, t, frequency, rssi);
+					}
+					else
+					{
+						printf(",%d,%d", frequency, rssi);
+					}
+				}
+				else
+					printf("%f, %d, %d\n", t, frequency, rssi);
 				break;
 			case SPECAN_GNUPLOT_NORMAL:
 				printf("%d %d\n", frequency, rssi);
-				if(frequency == high_freq)
+				if(frequency == sp_param.hi_hireq)	// 最高周波数と一致したら改行
 					printf("\n");
 				break;
 			case SPECAN_GNUPLOT_3D:
-				printf("%f %d %d\n", ((double)rx.clk100ns)/10000000,
+				printf("%f %d %d\n", t,
 				       frequency, rssi);
-				if(frequency == high_freq)
+				if(frequency == sp_param.hi_hireq)
 					printf("\n");
 				break;
 			default:
@@ -70,6 +118,11 @@ void cb_specan(ubertooth_t* ut __attribute__((unused)), void* args)
 				break;
 		}
 	}
+	if( output_mode == SPECAN_STDOUT && with_timestamp != 0 )
+	{
+		printf("\n");
+	}
+
 	fflush(stderr);
 }
 
@@ -89,6 +142,7 @@ static void usage(FILE *file)
 	fprintf(file, "\t-d <filename> output to file\n");
 	fprintf(file, "\t-l lower frequency (default 2402)\n");
 	fprintf(file, "\t-u upper frequency (default 2480)\n");
+	fprintf(file, "\t-t add timestamp\n");
 	fprintf(file, "\t-U<0-7> set ubertooth device to use\n");
 }
 
@@ -98,10 +152,18 @@ int main(int argc, char *argv[])
 	int lower= 2402, upper= 2480;
 	int ubertooth_device = -1;
 
+	sp_param.lo_freq = lower;
+	sp_param.hi_hireq = upper;
+	sp_param.dropit = 10;
+
 	ubertooth_t* ut = NULL;
 
-	while ((opt=getopt(argc,argv,"vhgGd:l::u::U:")) != EOF) {
+	with_timestamp = 0;
+	while ((opt=getopt(argc,argv,"tvhgGd:l::u::U:")) != EOF) {
 		switch(opt) {
+		case 't':
+			with_timestamp = 1;
+			break;
 		case 'v':
 			debug++;
 			break;
@@ -167,6 +229,9 @@ int main(int argc, char *argv[])
 		output_mode
 	};
 
+	sp_param.lo_freq = lower;
+	sp_param.hi_hireq = upper;
+
 	// init USB transfer
 	r = ubertooth_bulk_init(ut);
 	if (r < 0)
@@ -182,6 +247,7 @@ int main(int argc, char *argv[])
 		return r;
 
 	// receive and process each packet
+	sp_param.dropit = 10;
 	while(!ut->stop_ubertooth) {
 		ubertooth_bulk_receive(ut, cb_specan, specan_args);
 	}
